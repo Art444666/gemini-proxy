@@ -44,8 +44,10 @@ def main() -> None:
             "plan": "free",
             "region": "frankfurt",
             "healthCheckPath": "/healthz",
-            "buildCommand": "pip install -r requirements.txt",
-            "startCommand": "uvicorn main:app --host 0.0.0.0 --port $PORT",
+            "envSpecificDetails": {
+                "buildCommand": "pip install -r requirements.txt",
+                "startCommand": "uvicorn main:app --host 0.0.0.0 --port $PORT",
+            },
             "envVars": [{"key": "PYTHON_VERSION", "value": "3.12.0"}],
         },
     }
