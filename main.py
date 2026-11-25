@@ -7,6 +7,8 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 GROQ_BASE = "https://api.groq.com/openai/v1"
 GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta/openai"
+GEMINI_MODELS_URL = "https://generativelanguage.googleapis.com/v1beta/models"
+GEMINI_FALLBACK_MODELS = ["gemini-3.8-flash", "gemini-2.5-flash", "gemini-2.5-pro"]
 TIMEOUT = httpx.Timeout(connect=15.0, read=120.0, write=60.0, pool=15.0)
 RETRY_STATUS = {401, 403, 429, 503}
 
@@ -228,6 +230,69 @@ async def chat_handler(request: Request):
     return await json_chat(url, body, keys, gemini)
 
 
+async def fetch_groq_models(client: httpx.AsyncClient):
+    models = []
+    for key in groq_pool.order():
+        try:
+            resp = await client.get(f"{GROQ_BASE}/models", headers=upstream_headers(key, False))
+        except httpx.HTTPError:
+            continue
+        if resp.status_code in RETRY_STATUS:
+            continue
+        if resp.status_code != 200:
+            break
+        try:
+            payload = resp.json()
+        except Exception:
+            break
+        items = payload.get("data") if isinstance(payload, dict) else payload
+        for item in items or []:
+            if not isinstance(item, dict):
+                continue
+            model_id = str(item.get("id") or "").strip()
+            if model_id:
+                models.append({"id": model_id, "created": item.get("created") or 0, "owned_by": item.get("owned_by") or "groq"})
+        break
+    return models
+
+
+async def fetch_gemini_models(client: httpx.AsyncClient):
+    models = []
+    for key in gemini_pool.order():
+        try:
+            resp = await client.get(
+                GEMINI_MODELS_URL,
+                params={"key": key, "pageSize": 200},
+                headers={"x-goog-api-key": key, "Accept": "application/json"},
+            )
+        except httpx.HTTPError:
+            continue
+        if resp.status_code in RETRY_STATUS:
+            continue
+        if resp.status_code != 200:
+            break
+        try:
+            payload = resp.json()
+        except Exception:
+            break
+        for item in payload.get("models", []) if isinstance(payload, dict) else []:
+            if not isinstance(item, dict):
+                continue
+            methods = item.get("supportedGenerationMethods") or []
+            if methods and "generateContent" not in methods:
+                continue
+            model_id = str(item.get("name") or "").strip()
+            if model_id.startswith("models/"):
+                model_id = model_id[7:]
+            if model_id:
+                models.append({"id": model_id, "created": 0, "owned_by": "google"})
+        if models:
+            break
+    if not models:
+        models = [{"id": m, "created": 0, "owned_by": "google"} for m in GEMINI_FALLBACK_MODELS]
+    return models
+
+
 async def models_handler(request: Request):
     blocked = guard(request)
     if blocked is not None:
@@ -235,44 +300,16 @@ async def models_handler(request: Request):
     data = []
     seen = set()
     async with httpx.AsyncClient(timeout=TIMEOUT) as client:
-        for pool, base, gemini in ((groq_pool, GROQ_BASE, False), (gemini_pool, GEMINI_BASE, True)):
-            keys = pool.order()
-            if not keys:
-                continue
-            for key in keys:
-                try:
-                    resp = await client.get(f"{base}/models", headers=upstream_headers(key, gemini))
-                except httpx.HTTPError:
-                    continue
-                if resp.status_code in RETRY_STATUS:
-                    continue
-                if resp.status_code != 200:
-                    break
-                try:
-                    payload = resp.json()
-                except Exception:
-                    break
-                items = payload.get("data") if isinstance(payload, dict) else payload
-                for item in items or []:
-                    if not isinstance(item, dict):
-                        continue
-                    model_id = str(item.get("id") or item.get("name") or "").strip()
-                    if not model_id:
-                        continue
-                    if model_id.startswith("models/"):
-                        model_id = model_id[7:]
-                    if model_id in seen:
-                        continue
-                    seen.add(model_id)
-                    data.append(
-                        {
-                            "id": model_id,
-                            "object": "model",
-                            "created": item.get("created") or 0,
-                            "owned_by": item.get("owned_by") or ("google" if gemini else "groq"),
-                        }
-                    )
-                break
+        gathered = []
+        if groq_pool.keys:
+            gathered.extend(await fetch_groq_models(client))
+        if gemini_pool.keys:
+            gathered.extend(await fetch_gemini_models(client))
+    for item in gathered:
+        if item["id"] in seen:
+            continue
+        seen.add(item["id"])
+        data.append({"id": item["id"], "object": "model", "created": item["created"], "owned_by": item["owned_by"]})
     return JSONResponse(content={"object": "list", "data": data})
 
 
