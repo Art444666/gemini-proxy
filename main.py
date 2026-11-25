@@ -179,7 +179,9 @@ def provider_can_serve(provider: str, model: str) -> bool:
     if provider == "tokenharbor":
         if low.startswith(HARBOR_ALIASES):
             return True
-        return low.startswith(harbor_model_prefixes())
+        if low.startswith("gemini"):
+            return False
+        return low.startswith(tuple(harbor_model_prefixes()) or ("\0",))
     return True
 
 
