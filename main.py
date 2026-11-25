@@ -11,7 +11,7 @@ TOKENHARBOR_BASE = (os.getenv("TOKENHARBOR_BASE_URL", "") or "https://tokenharbo
 GEMINI_MODELS_URL = "https://generativelanguage.googleapis.com/v1beta/models"
 GEMINI_FALLBACK_MODELS = ["gemini-3.8-flash", "gemini-2.5-flash", "gemini-2.5-pro"]
 TIMEOUT = httpx.Timeout(connect=15.0, read=120.0, write=60.0, pool=15.0)
-RETRY_STATUS = {401, 403, 429, 503}
+RETRY_STATUS = {401, 402, 403, 429, 503}
 
 
 def parse_keys(name: str):
@@ -152,7 +152,7 @@ def route_model(model: str):
 
 def is_upstream_failure(result) -> bool:
     if isinstance(result, JSONResponse):
-        return result.status_code >= 429
+        return result.status_code in RETRY_STATUS or result.status_code >= 500
     return False
 
 
