@@ -7,6 +7,7 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 GROQ_BASE = "https://api.groq.com/openai/v1"
 GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta/openai"
+TOKENHARBOR_BASE = (os.getenv("TOKENHARBOR_BASE_URL", "") or "https://tokenharbor.ai/v1").rstrip("/")
 GEMINI_MODELS_URL = "https://generativelanguage.googleapis.com/v1beta/models"
 GEMINI_FALLBACK_MODELS = ["gemini-3.8-flash", "gemini-2.5-flash", "gemini-2.5-pro"]
 TIMEOUT = httpx.Timeout(connect=15.0, read=120.0, write=60.0, pool=15.0)
@@ -21,13 +22,18 @@ def parse_keys(name: str):
 
 
 class KeyPool:
-    def __init__(self, env_name: str):
-        self.env_name = env_name
+    def __init__(self, *env_names: str):
+        self.env_names = tuple(n for n in env_names if n)
         self.keys = []
         self.cursor = 0
 
     def refresh(self):
-        self.keys = parse_keys(self.env_name)
+        keys = []
+        for env_name in self.env_names:
+            for key in parse_keys(env_name):
+                if key not in keys:
+                    keys.append(key)
+        self.keys = keys
         if self.keys:
             self.cursor %= len(self.keys)
         else:
@@ -43,12 +49,39 @@ class KeyPool:
 
 groq_pool = KeyPool("GROQ_API_KEYS")
 gemini_pool = KeyPool("GEMINI_API_KEYS")
+harbor_pool = KeyPool("TOKENHARBOR_API_KEYS", "TOKENHARBOR_API_KEY")
+
+PROVIDER_BASE = {
+    "groq": GROQ_BASE,
+    "gemini": GEMINI_BASE,
+    "tokenharbor": TOKENHARBOR_BASE,
+}
+PROVIDER_POOL = {
+    "groq": groq_pool,
+    "gemini": gemini_pool,
+    "tokenharbor": harbor_pool,
+}
+PROVIDER_IS_GEMINI = {"gemini": True}
+PROVIDER_ORDER = ("tokenharbor", "groq", "gemini")
+HARBOR_ALIASES = ("tokenharbor/", "harbor/", "th/")
+GROQ_MODEL_PREFIXES = (
+    "llama",
+    "whisper",
+    "mixtral",
+    "gemma",
+    "groq/",
+    "openai/gpt-oss",
+    "meta-llama/",
+    "distil-whisper/",
+    "playai-",
+)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     groq_pool.refresh()
     gemini_pool.refresh()
+    harbor_pool.refresh()
     yield
 
 
@@ -90,10 +123,37 @@ def upstream_headers(key: str, gemini: bool, stream: bool = False):
     return headers
 
 
-def pick_pool(model: str):
-    if model.strip().lower().startswith("gemini"):
-        return gemini_pool, GEMINI_BASE, True
-    return groq_pool, GROQ_BASE, False
+def harbor_model_prefixes():
+    raw = os.getenv("TOKENHARBOR_MODEL_PREFIXES", "") or ""
+    for ch in (";", "\n", "\r", "\t", " "):
+        raw = raw.replace(ch, ",")
+    return [p.strip().lower() for p in raw.split(",") if p.strip()]
+
+
+def route_model(model: str):
+    """Return (provider, upstream_model) for a client-requested model id."""
+    name = model.strip()
+    low = name.lower()
+    for alias in HARBOR_ALIASES:
+        if low.startswith(alias):
+            return "tokenharbor", name[len(alias):].strip() or name
+    if low.startswith("gemini"):
+        return "gemini", name
+    if low.startswith(GROQ_MODEL_PREFIXES):
+        return "groq", name
+    for prefix in harbor_model_prefixes():
+        if low.startswith(prefix):
+            return "tokenharbor", name
+    default_provider = (os.getenv("DEFAULT_PROVIDER", "") or "").strip().lower()
+    if default_provider in PROVIDER_POOL:
+        return default_provider, name
+    return "groq", name
+
+
+def is_upstream_failure(result) -> bool:
+    if isinstance(result, JSONResponse):
+        return result.status_code >= 429
+    return False
 
 
 def extract_error(text: str, status: int):
@@ -116,6 +176,9 @@ async def health():
         "status": "ok",
         "groq_keys": len(groq_pool.keys),
         "gemini_keys": len(gemini_pool.keys),
+        "tokenharbor_keys": len(harbor_pool.keys),
+        "tokenharbor_base": TOKENHARBOR_BASE,
+        "default_provider": (os.getenv("DEFAULT_PROVIDER", "") or "").strip().lower() or None,
     }
 
 
@@ -219,15 +282,29 @@ async def chat_handler(request: Request):
     model = str(body.get("model") or "")
     if not model:
         return error_response("Missing required parameter: 'model'.", 400, "invalid_request_error", "missing_model", "model")
-    pool, base, gemini = pick_pool(model)
-    keys = pool.order()
-    if not keys:
-        provider = "gemini" if gemini else "groq"
-        return error_response(f"No API keys configured for provider '{provider}'.", 503, "api_error", "no_keys")
-    url = f"{base}/chat/completions"
-    if body.get("stream") is True:
-        return await stream_chat(url, body, keys, gemini)
-    return await json_chat(url, body, keys, gemini)
+    provider, upstream_model = route_model(model)
+    body["model"] = upstream_model
+
+    candidates = [provider] + [p for p in PROVIDER_ORDER if p != provider]
+    last_failure = None
+    for name in candidates:
+        keys = PROVIDER_POOL[name].order()
+        if not keys:
+            continue
+        base = PROVIDER_BASE[name]
+        gemini = PROVIDER_IS_GEMINI.get(name, False)
+        url = f"{base}/chat/completions"
+        if body.get("stream") is True:
+            result = await stream_chat(url, body, keys, gemini)
+        else:
+            result = await json_chat(url, body, keys, gemini)
+        if not is_upstream_failure(result):
+            return result
+        last_failure = result
+
+    if last_failure is not None:
+        return last_failure
+    return error_response(f"No API keys configured for provider '{provider}'.", 503, "api_error", "no_keys")
 
 
 async def fetch_groq_models(client: httpx.AsyncClient):
@@ -293,6 +370,31 @@ async def fetch_gemini_models(client: httpx.AsyncClient):
     return models
 
 
+async def fetch_tokenharbor_models(client: httpx.AsyncClient):
+    models = []
+    for key in harbor_pool.order():
+        try:
+            resp = await client.get(f"{TOKENHARBOR_BASE}/models", headers=upstream_headers(key, False))
+        except httpx.HTTPError:
+            continue
+        if resp.status_code in RETRY_STATUS or resp.status_code != 200:
+            continue
+        try:
+            payload = resp.json()
+        except Exception:
+            continue
+        items = payload.get("data") if isinstance(payload, dict) else payload
+        for item in items or []:
+            if not isinstance(item, dict):
+                continue
+            model_id = str(item.get("id") or "").strip()
+            if model_id:
+                models.append({"id": model_id, "created": item.get("created") or 0, "owned_by": item.get("owned_by") or "tokenharbor"})
+        if models:
+            break
+    return models
+
+
 async def models_handler(request: Request):
     blocked = guard(request)
     if blocked is not None:
@@ -305,6 +407,8 @@ async def models_handler(request: Request):
             gathered.extend(await fetch_groq_models(client))
         if gemini_pool.keys:
             gathered.extend(await fetch_gemini_models(client))
+        if harbor_pool.keys:
+            gathered.extend(await fetch_tokenharbor_models(client))
     for item in gathered:
         if item["id"] in seen:
             continue
