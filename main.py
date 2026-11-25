@@ -156,6 +156,33 @@ def is_upstream_failure(result) -> bool:
     return False
 
 
+def is_model_not_found(result) -> bool:
+    """True when the provider replied 404 / model_not_found."""
+    return isinstance(result, JSONResponse) and result.status_code == 404
+
+
+def translate_model(provider: str, model: str) -> str:
+    """Upstream model id to use on `provider` for a client-requested id."""
+    routed, upstream = route_model(model)
+    if routed == provider:
+        return upstream
+    return model.strip()
+
+
+def provider_can_serve(provider: str, model: str) -> bool:
+    """True when `provider` plausibly serves this exact model id."""
+    low = model.strip().lower()
+    if provider == "gemini":
+        return low.startswith("gemini")
+    if provider == "groq":
+        return low.startswith(GROQ_MODEL_PREFIXES)
+    if provider == "tokenharbor":
+        if low.startswith(HARBOR_ALIASES):
+            return True
+        return low.startswith(harbor_model_prefixes())
+    return True
+
+
 def extract_error(text: str, status: int):
     try:
         payload = json.loads(text)
@@ -283,10 +310,14 @@ async def chat_handler(request: Request):
     if not model:
         return error_response("Missing required parameter: 'model'.", 400, "invalid_request_error", "missing_model", "model")
     provider, upstream_model = route_model(model)
-    body["model"] = upstream_model
 
-    candidates = [provider] + [p for p in PROVIDER_ORDER if p != provider]
+    # Fallback only to providers that actually serve this model id.
+    candidates = [provider] + [
+        p for p in PROVIDER_ORDER
+        if p != provider and p in PROVIDER_POOL and provider_can_serve(p, model)
+    ]
     last_failure = None
+    primary_failure = None
     for name in candidates:
         keys = PROVIDER_POOL[name].order()
         if not keys:
@@ -294,14 +325,23 @@ async def chat_handler(request: Request):
         base = PROVIDER_BASE[name]
         gemini = PROVIDER_IS_GEMINI.get(name, False)
         url = f"{base}/chat/completions"
+        body["model"] = upstream_model if name == provider else translate_model(name, model)
         if body.get("stream") is True:
             result = await stream_chat(url, body, keys, gemini)
         else:
             result = await json_chat(url, body, keys, gemini)
         if not is_upstream_failure(result):
             return result
+        if name != provider and is_model_not_found(result):
+            continue
+        if name == provider:
+            primary_failure = result
         last_failure = result
 
+    if primary_failure is not None and (
+        last_failure is None or is_model_not_found(last_failure)
+    ):
+        return primary_failure
     if last_failure is not None:
         return last_failure
     return error_response(f"No API keys configured for provider '{provider}'.", 503, "api_error", "no_keys")
