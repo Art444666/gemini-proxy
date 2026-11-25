@@ -1,3 +1,4 @@
+import base64
 import os
 import json
 import httpx
@@ -10,7 +11,7 @@ GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta/openai"
 TOKENHARBOR_BASE = (os.getenv("TOKENHARBOR_BASE_URL", "") or "https://tokenharbor.ai/v1").rstrip("/")
 GEMINI_MODELS_URL = "https://generativelanguage.googleapis.com/v1beta/models"
 GEMINI_FALLBACK_MODELS = ["gemini-3.8-flash", "gemini-2.5-flash", "gemini-2.5-pro"]
-TIMEOUT = httpx.Timeout(connect=15.0, read=120.0, write=60.0, pool=15.0)
+TIMEOUT = httpx.Timeout(connect=20.0, read=300.0, write=300.0, pool=30.0)
 RETRY_STATUS = {401, 402, 403, 429, 503}
 
 
@@ -297,17 +298,272 @@ async def stream_chat(url: str, body: dict, keys, gemini: bool):
         },
     )
 
+MAX_BODY_BYTES = int(os.getenv("MAX_BODY_BYTES", "") or 48 * 1024 * 1024)
+MAX_INLINE_FILE_BYTES = int(os.getenv("MAX_INLINE_FILE_BYTES", "") or 16 * 1024 * 1024)
+TEXT_PART_TYPES = {"text", "input_text", "output_text", "summary_text"}
+IMAGE_PART_TYPES = {"image_url", "input_image", "image", "image_base64", "input_image_url"}
+FILE_PART_TYPES = {
+    "file", "input_file", "file_data", "file_url", "input_file_data", "attachment",
+    "document", "audio", "input_audio", "audio_url", "video", "input_video",
+}
+TEXTUAL_MIME = (
+    "text/", "application/json", "application/xml", "application/csv",
+    "application/x-yaml", "application/javascript",
+)
+
+
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    return error_response(
+        f"Gateway internal error: {exc.__class__.__name__}: {str(exc)[:200]}",
+        500,
+        "api_error",
+        "gateway_error",
+    )
+
+
+app.add_exception_handler(Exception, unhandled_exception_handler)
+
+
+def _part_text(part):
+    for key in ("text", "input_text", "content", "summary"):
+        value = part.get(key)
+        if isinstance(value, str):
+            return value
+    return ""
+
+
+def _part_url(part):
+    for key in (
+        "image_url", "url", "file_url", "file_data", "file_data_url", "data",
+        "image_base64", "base64", "b64_json", "input_image", "file", "image", "audio",
+    ):
+        value = part.get(key)
+        if isinstance(value, dict):
+            value = _part_url(value)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def _mime_of(url):
+    if not url.startswith("data:"):
+        return ""
+    head = url[5:].split(",", 1)[0]
+    return head.split(";", 1)[0].strip().lower()
+
+
+def _decode_text_data_url(url):
+    if not url.startswith("data:") or ";base64," not in url:
+        return ""
+    payload = url.split(";base64,", 1)[1]
+    try:
+        raw = base64.b64decode(payload + "===")
+    except Exception:
+        return ""
+    for encoding in ("utf-8", "cp1251", "latin-1"):
+        try:
+            return raw.decode(encoding)
+        except Exception:
+            continue
+    return ""
+
+
+def _part_name(part):
+    for key in ("filename", "name", "file_name", "title"):
+        value = part.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    for key in ("file", "image_url", "file_data", "input_file", "document", "attachment"):
+        value = part.get(key)
+        if isinstance(value, dict):
+            found = _part_name(value)
+            if found:
+                return found
+    return ""
+
+
+def normalize_multimodal(body):
+    """Coerce OpenAI/Responses style multimodal parts into parts upstream can digest."""
+    messages = body.get("messages")
+    if not isinstance(messages, list):
+        return body
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content")
+        if content is None or isinstance(content, str):
+            continue
+        if not isinstance(content, list):
+            message["content"] = str(content)
+            continue
+        parts = []
+        notes = []
+        for part in content:
+            if isinstance(part, str):
+                parts.append({"type": "text", "text": part})
+                continue
+            if not isinstance(part, dict):
+                continue
+            kind = str(part.get("type") or "").strip().lower().replace("-", "_")
+            text = _part_text(part)
+            url = _part_url(part)
+            mime = _mime_of(url)
+            name = _part_name(part) or kind or "file"
+            if kind in TEXT_PART_TYPES or (text and not url):
+                parts.append({"type": "text", "text": text})
+                continue
+            if kind in IMAGE_PART_TYPES and url:
+                parts.append({"type": "image_url", "image_url": {"url": url}})
+                continue
+            if kind in FILE_PART_TYPES or url:
+                if not url:
+                    if text:
+                        parts.append({"type": "text", "text": text})
+                    else:
+                        notes.append(f"skipped attachment {name}: empty payload")
+                    continue
+                if mime.startswith(TEXTUAL_MIME):
+                    decoded = _decode_text_data_url(url)
+                    if decoded:
+                        parts.append({"type": "text", "text": f"--- {name} ---\n{decoded}"})
+                        continue
+                parts.append({"type": "image_url", "image_url": {"url": url}})
+                if not mime.startswith("image/"):
+                    notes.append(f"attachment {name} ({mime or 'unknown type'}) forwarded")
+                continue
+            if text:
+                parts.append({"type": "text", "text": text})
+            else:
+                notes.append(f"skipped part {name}: unsupported type")
+        if notes:
+            parts.append({"type": "text", "text": "[gateway] " + "; ".join(notes)})
+        if not parts:
+            parts.append({"type": "text", "text": ""})
+        message["content"] = parts
+    return body
+
+
+async def multipart_body(request: Request):
+    form = await request.form()
+    fields = {}
+    uploads = []
+    for key, value in form.multi_items():
+        if hasattr(value, "read"):
+            uploads.append((str(key), value))
+        else:
+            fields[str(key)] = value if isinstance(value, str) else str(value)
+    messages = []
+    raw_messages = fields.get("messages")
+    if raw_messages:
+        try:
+            parsed = json.loads(raw_messages)
+            if isinstance(parsed, dict):
+                parsed = parsed.get("messages") or []
+            if isinstance(parsed, list):
+                messages = [m for m in parsed if isinstance(m, dict)]
+        except Exception:
+            messages = []
+    attachments = []
+    for key, upload in uploads:
+        try:
+            data = await upload.read()
+        except Exception:
+            continue
+        if not data:
+            continue
+        name = getattr(upload, "filename", "") or key or "file"
+        if MAX_INLINE_FILE_BYTES > 0 and len(data) > MAX_INLINE_FILE_BYTES:
+            attachments.append({"type": "text", "text": f"[gateway] {name}: file is larger than {MAX_INLINE_FILE_BYTES} bytes, skipped"})
+            continue
+        mime = (getattr(upload, "content_type", "") or "").strip() or "application/octet-stream"
+        encoded = base64.b64encode(data).decode("ascii")
+        attachments.append(
+            {
+                "type": "file",
+                "file": {"filename": name, "file_data": f"data:{mime};base64,{encoded}"},
+            }
+        )
+    if attachments:
+        messages.append({"role": "user", "content": attachments})
+    if not messages:
+        prompt = fields.get("prompt") or fields.get("message") or fields.get("q") or ""
+        messages = [{"role": "user", "content": [{"type": "text", "text": prompt}]}]
+    body = {
+        "model": str(fields.get("model") or fields.get("model_name") or ""),
+        "messages": messages,
+    }
+    if str(fields.get("stream", "")).strip().lower() in ("1", "true", "yes"):
+        body["stream"] = True
+    for key in (
+        "temperature", "top_p", "max_tokens", "max_completion_tokens", "stop",
+        "presence_penalty", "frequency_penalty", "seed", "n", "response_format",
+        "tools", "tool_choice", "user",
+    ):
+        if key in fields:
+            try:
+                body[key] = json.loads(fields[key])
+            except Exception:
+                body[key] = fields[key]
+    return body
+
+
+async def read_chat_body(request: Request):
+    """Read a chat body (JSON or multipart with files), enforce a size cap, never raise."""
+    try:
+        raw = await request.body()
+    except Exception as exc:
+        return None, error_response(
+            f"Failed to read request body: {exc.__class__.__name__}",
+            400,
+            "invalid_request_error",
+            "invalid_body",
+        )
+    if MAX_BODY_BYTES > 0 and len(raw) > MAX_BODY_BYTES:
+        return None, error_response(
+            f"Request body is {len(raw)} bytes, the gateway limit is {MAX_BODY_BYTES}. Attach a smaller file or pass an http(s) URL.",
+            413,
+            "invalid_request_error",
+            "payload_too_large",
+        )
+    ctype = (request.headers.get("content-type") or "").lower()
+    if "multipart/form-data" in ctype:
+        try:
+            body = await multipart_body(request)
+        except Exception as exc:
+            return None, error_response(
+                f"Malformed multipart body: {exc.__class__.__name__}",
+                400,
+                "invalid_request_error",
+                "invalid_multipart",
+            )
+    else:
+        stripped = raw.strip()
+        if not stripped:
+            return None, error_response("Invalid JSON body.", 400, "invalid_request_error", "invalid_json")
+        try:
+            body = json.loads(stripped.decode("utf-8", "ignore"))
+        except Exception:
+            return None, error_response(
+                "Invalid JSON body. Send application/json; multipart/form-data is accepted for file uploads.",
+                400,
+                "invalid_request_error",
+                "invalid_json",
+            )
+    if not isinstance(body, dict):
+        return None, error_response("JSON body must be an object.", 400, "invalid_request_error", "invalid_json")
+    try:
+        body = normalize_multimodal(body)
+    except Exception:
+        pass
+    return body, None
 
 async def chat_handler(request: Request):
     blocked = guard(request)
     if blocked is not None:
         return blocked
-    try:
-        body = await request.json()
-    except Exception:
-        return error_response("Invalid JSON body.", 400, "invalid_request_error", "invalid_json")
-    if not isinstance(body, dict):
-        return error_response("JSON body must be an object.", 400, "invalid_request_error", "invalid_json")
+    body, failure = await read_chat_body(request)
+    if failure is not None:
+        return failure
     model = str(body.get("model") or "")
     if not model:
         return error_response("Missing required parameter: 'model'.", 400, "invalid_request_error", "missing_model", "model")
